@@ -76,7 +76,9 @@ class SlotIn(BaseModel):
 
 class TubeIn(BaseModel):
     id: int
-    mass: float = Field(gt=0)
+    # 正性与有限性由求解逻辑统一校验并返回 400(避免 pydantic 回显 NaN/Inf
+    # 导致错误响应本身无法 JSON 序列化); 类型错误仍由 pydantic 返回 422
+    mass: float
     locked: bool = False
     slot: Optional[int] = None
 
@@ -207,8 +209,11 @@ class PlanRequest(BaseModel):
     slot_count: int = Field(default=12, ge=1, le=128)
     slots: list[SlotIn] = Field(default_factory=list)
     tubes: list[TubeIn] = Field(default_factory=list)
-    radius_mm: float = Field(default=100.0, gt=0)
-    rpm: float = Field(default=4000.0, ge=0)
+    # 半径/转速的正性、非负性与有限性由求解逻辑统一校验并返回 400(与试管质量
+    # 一致, 避免 pydantic 回显 NaN/Inf); 求解中间量溢出同样由求解逻辑拒绝
+    radius_mm: float = 100.0
+    rpm: float = 4000.0
+    # 优化权重的有限性同样由求解逻辑统一校验并返回 400
     w1: float = 1.0
     w2: float = 0.000001
     move_weight: float = 0.0

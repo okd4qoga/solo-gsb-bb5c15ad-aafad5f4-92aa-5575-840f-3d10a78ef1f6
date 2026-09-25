@@ -314,6 +314,33 @@ for bad_ang in (float("nan"), float("inf")):
         assert e.status_code==400
         print("non-finite angle 400 OK:", e.detail)
 
+# 非有限数值与计算溢出: 一律 400 且不保存方案
+n_before_nf = len(call("GET","/api/plans")["items"])
+nf_cases = []
+_b = dict(req_body); _b["tubes"]=[{"id":1,"mass":float("inf")},{"id":2,"mass":50}]
+nf_cases.append(("试管质量 Infinity", _b))
+_b = dict(req_body); _b["tubes"]=[{"id":1,"mass":float("nan")},{"id":2,"mass":50}]
+nf_cases.append(("试管质量 NaN", _b))
+_b = dict(req_body); _b["w1"]=float("nan"); nf_cases.append(("w1 NaN", _b))
+_b = dict(req_body); _b["w2"]=float("inf"); nf_cases.append(("w2 Infinity", _b))
+_b = dict(req_body); _b["move_weight"]=float("nan"); nf_cases.append(("move_weight NaN", _b))
+_b = dict(req_body); _b["radius_mm"]=float("inf"); nf_cases.append(("半径 Infinity", _b))
+_b = dict(req_body); _b["rpm"]=float("nan"); nf_cases.append(("转速 NaN", _b))
+_b = dict(req_body); _b["tubes"]=[{"id":1,"mass":1e308},{"id":2,"mass":1e308}]
+nf_cases.append(("质量溢出", _b))
+_b = dict(req_body); _b["rpm"]=1e308; nf_cases.append(("转速溢出", _b))
+_b = dict(req_body); _b["radius_mm"]=1e308; nf_cases.append(("半径溢出", _b))
+_b = dict(req_body); _b["w1"]=1e308
+_b["tubes"]=[{"id":1,"mass":1e100},{"id":2,"mass":1e100}]
+nf_cases.append(("目标函数溢出", _b))
+for _tag, _body in nf_cases:
+    try:
+        call("POST","/api/plan",_body); raise SystemExit("should 400: "+_tag)
+    except main.HTTPException as e:
+        assert e.status_code==400, (_tag, e.status_code)
+assert len(call("GET","/api/plans")["items"])==n_before_nf, "非有限/溢出请求不得保存方案"
+print("non-finite/overflow 400 not-saved OK (%d cases)" % len(nf_cases))
+
 # 增量重排
 inc=dict(req_body); inc["name"]="增量方案"
 inc["tubes"]=[dict(t) for t in req_body["tubes"]]+[{"id":7,"mass":20}]

@@ -208,6 +208,10 @@ class Solver:
             if t.id in ids:
                 raise ValueError(f"试管编号 {t.id} 重复。")
             ids.add(t.id)
+            if not math.isfinite(t.mass):
+                raise ValueError(
+                    f"试管 {t.id} 质量必须为有限数值(不能为 NaN 或无穷大)。"
+                )
             if t.mass <= 0:
                 raise ValueError(f"试管 {t.id} 质量必须为正数。")
         for t in self.tubes:
@@ -225,9 +229,59 @@ class Solver:
             raise ValueError(
                 f"试管数量({len(self.tubes)})超过可用槽位数量({len(enabled)})。"
             )
-        if self.radius_mm <= 0 or self.rpm < 0:
-            raise ValueError("半径必须为正, 转速不能为负。")
+        if not math.isfinite(self.radius_mm) or self.radius_mm <= 0:
+            raise ValueError("半径必须为有限的正数。")
+        if not math.isfinite(self.rpm) or self.rpm < 0:
+            raise ValueError("转速必须为有限的非负数。")
+        for label, val in (("w1", self.w1), ("w2", self.w2),
+                           ("move_weight", self.move_weight)):
+            if not math.isfinite(val):
+                raise ValueError(
+                    f"优化参数 {label} 必须为有限数值(不能为 NaN 或无穷大)。"
+                )
+        self._validate_numeric_bounds()
         self._validate_mutex_pairs(enabled)
+
+    def _validate_numeric_bounds(self) -> None:
+        """有限但极大的输入也会在求解与指标计算中溢出, 在求解前按上界拒绝。
+
+        输入全部为有限数的前提下, 求解器各环节数值仍有上界: 总质量 M、
+        质径积上界 M·R(U₁/U₂ 与单管向量)、目标函数上界
+        (|w₁|+|w₂|)·M² + |move_weight|·n(构造/退火/爬山与精确枚举评分),
+        以及力学指标链 ω → ω² → F = ω²·|U₁|·1e-6 → τ = F·R/1000。
+        任一上界超出双精度浮点范围即抛 ValueError(API 层转为 400), 避免
+        求解中途抛出未处理的 OverflowError 或产出非有限指标。
+        """
+        m_total = sum(t.mass for t in self.tubes)
+        if not math.isfinite(m_total):
+            raise ValueError(
+                "试管总质量溢出(超出双精度浮点范围), 请减小试管质量。"
+            )
+        mr = m_total * self.radius_mm
+        if not math.isfinite(mr):
+            raise ValueError(
+                "质量与半径的乘积(质径积上界)溢出, 请减小试管质量或半径。"
+            )
+        m_sq = m_total * m_total
+        score_bound = (
+            (abs(self.w1) + abs(self.w2)) * m_sq
+            + abs(self.move_weight) * len(self.tubes)
+        )
+        if not (math.isfinite(m_sq) and math.isfinite(score_bound)):
+            raise ValueError(
+                "目标函数数值上界溢出(质量平方与优化权重的乘积超出双精度浮点范围), "
+                "请减小试管质量或优化权重。"
+            )
+        omega = TWO_PI * self.rpm / 60.0
+        omega_sq = omega * omega
+        force = omega_sq * (mr * 1e-6)
+        torque = force * self.radius_mm / 1000.0
+        if not (math.isfinite(omega) and math.isfinite(omega_sq)
+                and math.isfinite(force) and math.isfinite(torque)):
+            raise ValueError(
+                "力学指标计算溢出(转速或半径过大, 角速度/离心力/力矩超出双精度浮点范围), "
+                "请降低转速或半径。"
+            )
 
     def _validate_mutex_pairs(self, enabled: set[int]) -> None:
         """校验互斥对输入, 并检测锁定试管互斥冲突(结构性不可行)。
@@ -1153,7 +1207,7 @@ class Solver:
         force = omega ** 2 * abs(u1_si)          # N
         torque = force * self.radius_mm / 1000.0  # N·m
         ecc = (u1_mag / m_total) if m_total else 0.0  # mm 等效偏心距
-        return {
+        metrics = {
             "u1_mag_g_mm": u1_mag,
             "u1_angle_deg": math.degrees(math.atan2(u1v.imag, u1v.real)) % 360.0,
             "u1_x_g_mm": u1v.real,
@@ -1170,6 +1224,15 @@ class Solver:
             "rpm": self.rpm,
             "angular_velocity_rad_s": omega,
         }
+        # 结果形成处复核: 派生指标必须全部有限(输入上界校验已拦截溢出,
+        # 此处为兜底, 非有限即抛 ValueError, API 层转为 400 且不保存)
+        for key, value in metrics.items():
+            if isinstance(value, float) and not math.isfinite(value):
+                raise ValueError(
+                    f"计算溢出: 派生指标 {key} 为非有限数值, "
+                    "请减小试管质量、半径或转速后重试。"
+                )
+        return metrics
 
     @staticmethod
     def _grade(ecc_mm: float) -> str:
@@ -1376,4 +1439,12 @@ def run_plan(payload: dict[str, Any]) -> dict[str, Any]:
         mutex_pairs=_parse_mutex_pairs(payload.get("mutex_pairs")),
     )
     previous = payload.get("previous")
-    return solver.solve(previous=previous)
+    try:
+        return solver.solve(previous=previous)
+    except OverflowError as exc:
+        # 兜底: 输入有限性与数值上界已在 validate() 拦截溢出, 此处把任何残余
+        # 的数值溢出统一转为 ValueError(API 层转为 400, 不保存方案)
+        raise ValueError(
+            "计算溢出(数值超出双精度浮点范围), "
+            "请减小试管质量、半径、转速或优化权重。"
+        ) from exc

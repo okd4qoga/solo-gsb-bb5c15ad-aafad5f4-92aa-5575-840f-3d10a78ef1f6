@@ -280,5 +280,103 @@ class TestBalancer(unittest.TestCase):
             self.assertIn("reason", sg)
 
 
+class TestNumericBoundary(unittest.TestCase):
+    """数值边界: 非有限输入与计算溢出必须抛 ValueError(API 层转为 400 且不保存)。
+
+    正常量级(含很大但不溢出的数值)的求解行为与指标语义不变。
+    """
+
+    def two_tubes(self, **over):
+        p = base_payload(tubes=[{"id": 1, "mass": 50}, {"id": 2, "mass": 50}])
+        p.update(over)
+        return p
+
+    def test_nonfinite_tube_mass_rejected(self):
+        for bad in (float("inf"), float("-inf"), float("nan")):
+            p = self.two_tubes()
+            p["tubes"][0]["mass"] = bad
+            with self.assertRaises(ValueError, msg=f"mass={bad}"):
+                run_plan(p)
+
+    def test_nonfinite_params_rejected(self):
+        for key in ("radius_mm", "rpm", "w1", "w2", "move_weight"):
+            for bad in (float("inf"), float("-inf"), float("nan")):
+                p = self.two_tubes(**{key: bad})
+                with self.assertRaises(ValueError, msg=f"{key}={bad}"):
+                    run_plan(p)
+
+    def test_sign_rules_unchanged(self):
+        # 有限但符号非法的输入沿用原有拒绝语义
+        for key, bad in (("radius_mm", 0.0), ("radius_mm", -1.0), ("rpm", -1.0)):
+            p = self.two_tubes(**{key: bad})
+            with self.assertRaises(ValueError, msg=f"{key}={bad}"):
+                run_plan(p)
+        p = self.two_tubes()
+        p["tubes"][0]["mass"] = 0.0
+        with self.assertRaises(ValueError):
+            run_plan(p)
+
+    def test_huge_mass_radius_product_overflow(self):
+        # 质量×半径(质径积上界)溢出
+        with self.assertRaises(ValueError):
+            run_plan(self.two_tubes(radius_mm=1e308))
+        p = self.two_tubes(tubes=[{"id": 1, "mass": 1e200}, {"id": 2, "mass": 1e200}],
+                           radius_mm=1e200)
+        with self.assertRaises(ValueError):
+            run_plan(p)
+
+    def test_huge_mass_objective_overflow(self):
+        # 总质量 / 质量平方(目标函数上界)溢出: 即使权重为 0 也会在评分中溢出
+        p = self.two_tubes(tubes=[{"id": 1, "mass": 1e308}, {"id": 2, "mass": 1e308}])
+        with self.assertRaises(ValueError):
+            run_plan(p)
+        p = self.two_tubes(tubes=[{"id": 1, "mass": 1e200}, {"id": 2, "mass": 1e200}],
+                           w1=0.0, w2=0.0)
+        with self.assertRaises(ValueError):
+            run_plan(p)
+        # 权重极大: 评分静默溢出为 inf
+        p = self.two_tubes(w1=1e308,
+                           tubes=[{"id": 1, "mass": 1e100}, {"id": 2, "mass": 1e100}])
+        with self.assertRaises(ValueError):
+            run_plan(p)
+
+    def test_huge_rpm_metric_overflow(self):
+        # 转速极大: 角速度/离心力指标链溢出
+        for bad_rpm in (1e308, 1e200):
+            with self.assertRaises(ValueError, msg=f"rpm={bad_rpm}"):
+                run_plan(self.two_tubes(rpm=bad_rpm))
+
+    def test_overflow_rejected_on_exact_mutex_path(self):
+        p = self.two_tubes(
+            tubes=[{"id": i, "mass": 1e308} for i in range(1, 4)],
+            mutex_pairs=[{"tube_a": 1, "tube_b": 2}],
+        )
+        with self.assertRaises(ValueError):
+            run_plan(p)
+
+    def test_large_but_safe_values_still_solve(self):
+        # 很大但各环节均不溢出的数值: 正常求解且全部派生指标有限
+        p = base_payload(
+            radius_mm=1e4, rpm=1e6,
+            tubes=[{"id": 1, "mass": 1e6}, {"id": 2, "mass": 1e6},
+                   {"id": 3, "mass": 9.99e5}, {"id": 4, "mass": 1.001e6}],
+        )
+        r = run_plan(p)
+        m = r["metrics"]
+        for key in ("u1_mag_g_mm", "u2_mag_g_mm", "centrifugal_force_n",
+                    "resultant_moment_n_m", "equivalent_eccentricity_um",
+                    "angular_velocity_rad_s", "total_mass_g"):
+            self.assertTrue(math.isfinite(m[key]), key)
+        self.assertEqual(len(r["placements"]), 4)
+        # 力学关系保持原有语义: F = ω²·|U₁|·1e-6, M = F·R/1000
+        omega = 2 * math.pi * 1e6 / 60
+        self.assertAlmostEqual(m["centrifugal_force_n"],
+                               omega ** 2 * m["u1_mag_g_mm"] * 1e-6,
+                               delta=max(1.0, m["centrifugal_force_n"] * 1e-9))
+        self.assertAlmostEqual(m["resultant_moment_n_m"],
+                               m["centrifugal_force_n"] * 1e4 / 1000.0,
+                               delta=max(1.0, m["resultant_moment_n_m"] * 1e-9))
+
+
 if __name__ == "__main__":
     unittest.main()
