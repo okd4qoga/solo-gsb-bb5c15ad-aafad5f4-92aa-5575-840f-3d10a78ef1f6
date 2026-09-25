@@ -22,6 +22,24 @@ from typing import Any, Optional
 TWO_PI = 2.0 * math.pi
 
 
+def _sq_abs(z: complex) -> float:
+    """|z|² 的饱和计算: 内部溢出时返回 +inf 而非抛 OverflowError。
+
+    参与计算的有限输入可能大到 |z|² 超出浮点范围; 此时评分记为 inf,
+    由结果形成处的有限性校验统一拒绝(不产生未处理异常)。
+    """
+    try:
+        return abs(z) ** 2
+    except OverflowError:
+        return math.inf
+
+
+def _assert_finite(value: float, what: str) -> None:
+    """派生数值有限性闸门: NaN/Inf 一律视为计算溢出并拒绝出结果。"""
+    if not math.isfinite(value):
+        raise ValueError(f"{what}超出可表示的数值范围(数值过大导致溢出)。")
+
+
 # ---------------------------------------------------------------------------
 # 槽位几何规范化
 # ---------------------------------------------------------------------------
@@ -208,6 +226,8 @@ class Solver:
             if t.id in ids:
                 raise ValueError(f"试管编号 {t.id} 重复。")
             ids.add(t.id)
+            if not math.isfinite(float(t.mass)):
+                raise ValueError(f"试管 {t.id} 的质量必须是有限数值(不能为 NaN/Infinity)。")
             if t.mass <= 0:
                 raise ValueError(f"试管 {t.id} 质量必须为正数。")
         for t in self.tubes:
@@ -225,8 +245,17 @@ class Solver:
             raise ValueError(
                 f"试管数量({len(self.tubes)})超过可用槽位数量({len(enabled)})。"
             )
-        if self.radius_mm <= 0 or self.rpm < 0:
-            raise ValueError("半径必须为正, 转速不能为负。")
+        if not math.isfinite(float(self.radius_mm)) or self.radius_mm <= 0:
+            raise ValueError("半径必须为有限正数(不能为 NaN/Infinity)。")
+        if not math.isfinite(float(self.rpm)) or self.rpm < 0:
+            raise ValueError("转速必须为有限的非负数(不能为 NaN/Infinity)。")
+        for name, w in (("一阶权重 w1", self.w1),
+                        ("二阶权重 w2", self.w2),
+                        ("移动罚权 move_weight", self.move_weight)):
+            if not math.isfinite(float(w)):
+                raise ValueError(f"{name} 必须是有限数值(不能为 NaN/Infinity)。")
+            if w < 0:
+                raise ValueError(f"{name} 不能为负数。")
         self._validate_mutex_pairs(enabled)
 
     def _validate_mutex_pairs(self, enabled: set[int]) -> None:
@@ -314,7 +343,10 @@ class Solver:
             if not self._by_id[tid].locked and self._origin.get(tid) is not None
             and self._origin[tid] != slot
         )
-        return self.move_weight * moved
+        try:
+            return self.move_weight * moved
+        except OverflowError:
+            return math.inf
 
     # ------------------------------------------------------------------
     # 状态初始化
@@ -344,11 +376,10 @@ class Solver:
         self._u2 -= self._c2(slot_idx, t.mass)
 
     def _score(self, u1: complex, u2: complex, loc: dict[int, int]) -> float:
-        return (
-            self.w1 * abs(u1) ** 2
-            + self.w2 * abs(u2) ** 2
-            + self._penalty(loc)
-        )
+        # |z|² 对有限但极大的质径积可能溢出; 饱和为 inf, 使搜索不抛异常,
+        # 最终由结果形成处的有限性闸门统一以 ValueError 拒绝。
+        score = self.w1 * _sq_abs(u1) + self.w2 * _sq_abs(u2) + self._penalty(loc)
+        return score if math.isfinite(score) else math.inf
 
     # ------------------------------------------------------------------
     # 锁定试管放置
@@ -831,11 +862,22 @@ class Solver:
 
         best = {"score": math.inf, "key": None, "assign": None, "count": 0, "leaves": 0}
         assign = [-1] * n_free
+        overflow = False
 
         def dfs(k, ux, uy, vx, vy, moved):
+            nonlocal overflow
             if k == n_free:
                 best["leaves"] += 1
-                sc = w1 * (ux * ux + uy * uy) + w2 * (vx * vx + vy * vy) + mw * moved
+                # 质径积累加可能溢出为 inf(浮点乘法饱和而不抛异常), 也可能
+                # 直接抛 OverflowError; 两者都记为溢出, 不得当成"无合法摆放"。
+                try:
+                    sc = w1 * (ux * ux + uy * uy) + w2 * (vx * vx + vy * vy) + mw * moved
+                except OverflowError:
+                    overflow = True
+                    return
+                if not math.isfinite(sc):
+                    overflow = True
+                    return
                 bs = best["score"]
                 tol = self._EXACT_TIE_REL * max(1.0, abs(bs))
                 if sc < bs - tol:
@@ -889,6 +931,11 @@ class Solver:
 
         dfs(0, u1x0, u1y0, u2x0, u2y0, 0)
         if best["assign"] is None:
+            if overflow:
+                raise ValueError(
+                    "试管质量与半径的乘积过大, 互斥精确枚举中的不平衡量超出可表示的"
+                    "数值范围; 请减小质量或半径后重试。"
+                )
             raise ValueError(
                 "不可行: 在互斥试管隔离约束(互斥对不得落在物理相邻槽位)下不存在合法摆放。"
             )
@@ -1045,6 +1092,13 @@ class Solver:
                 best_score, best_variant = sc, v
                 best_state = self._state()
 
+        if best_variant is None or not math.isfinite(best_score):
+            # 所有候选布局的评分(及因此的不平衡量)都溢出浮点范围。
+            raise ValueError(
+                "试管质量与半径的乘积过大, 不平衡量超出可表示的数值范围; "
+                "请减小质量或半径后重试。"
+            )
+
         # 复跑最佳变体(确定性 RNG)并记录可解释步骤
         self._track = True
         self._anneal_recorded = 0
@@ -1136,13 +1190,45 @@ class Solver:
         }
         if self._exact_info is not None:
             result["exact_search"] = self._exact_info
+        # 最终闸门: 出现在结果中的任何数值(指标、逐管质径积、回放快照、
+        # 配对残差、精确搜索评分等)都必须有限——非有限值无法 JSON 序列化,
+        # 也意味着参与计算的输入或派生指标已经溢出, 此时拒绝出结果/落库。
+        self._assert_result_finite(result)
         return result
+
+    @staticmethod
+    def _assert_result_finite(node: Any, path: str = "result") -> None:
+        if isinstance(node, bool):
+            return
+        if isinstance(node, int):
+            return
+        if isinstance(node, float):
+            if not math.isfinite(node):
+                raise ValueError(
+                    f"计算结果中的数值 {path} 非有限(NaN/Infinity), "
+                    f"通常因质量、半径、转速过大导致溢出; 请缩小输入后重试。"
+                )
+            return
+        if isinstance(node, complex):
+            if not (math.isfinite(node.real) and math.isfinite(node.imag)):
+                raise ValueError(f"计算结果中的向量 {path} 非有限, 数值溢出。")
+            return
+        if isinstance(node, dict):
+            for k, v in node.items():
+                Solver._assert_result_finite(v, f"{path}.{k}")
+            return
+        if isinstance(node, (list, tuple)):
+            for i, v in enumerate(node):
+                Solver._assert_result_finite(v, f"{path}[{i}]")
 
     def _tube_vector(self, t: Tube, slot: Optional[int], order: int) -> Optional[dict[str, Any]]:
         if slot is None:
             return None
         ang = _d(self.slots[slot].angle) * order
-        v = t.mass * self.radius_mm * complex(math.cos(ang), math.sin(ang))
+        try:
+            v = t.mass * self.radius_mm * complex(math.cos(ang), math.sin(ang))
+        except OverflowError:
+            v = complex(math.inf, math.inf)
         return {"x": v.real, "y": v.imag, "mag": abs(v)}
 
     def _metrics(self, u1v: complex, u2v: complex, m_total: float) -> dict[str, Any]:
@@ -1150,10 +1236,21 @@ class Solver:
         u1_mag, u2_mag = abs(u1v), abs(u2v)
         # u1v 单位 g·mm → kg·m 需 ×1e-6
         u1_si = u1v * 1e-6
-        force = omega ** 2 * abs(u1_si)          # N
-        torque = force * self.radius_mm / 1000.0  # N·m
-        ecc = (u1_mag / m_total) if m_total else 0.0  # mm 等效偏心距
-        return {
+        # 有限但极大的转速/不平衡量可能使 ω² 或 F/M 溢出; 饱和为 inf,
+        # 随后的有限性闸门统一拒绝, 不产生非有限指标。
+        if u1_mag == 0.0:
+            force = 0.0
+        else:
+            try:
+                force = omega ** 2 * abs(u1_si)          # N
+            except OverflowError:
+                force = math.inf
+        try:
+            torque = force * self.radius_mm / 1000.0      # N·m
+        except OverflowError:
+            torque = math.inf
+        ecc = (u1_mag / m_total) if m_total else 0.0      # mm 等效偏心距
+        metrics = {
             "u1_mag_g_mm": u1_mag,
             "u1_angle_deg": math.degrees(math.atan2(u1v.imag, u1v.real)) % 360.0,
             "u1_x_g_mm": u1v.real,
@@ -1170,6 +1267,26 @@ class Solver:
             "rpm": self.rpm,
             "angular_velocity_rad_s": omega,
         }
+        self._check_metrics_finite(metrics)
+        return metrics
+
+    @staticmethod
+    def _check_metrics_finite(metrics: dict[str, Any]) -> None:
+        """派生指标有限性闸门: 任一数值指标非有限即视为溢出, 拒绝出结果。"""
+        labels = {
+            "u1_mag_g_mm": "一阶不平衡量",
+            "u2_mag_g_mm": "二阶不平衡量",
+            "centrifugal_force_n": "离心合力",
+            "resultant_moment_n_m": "合力矩",
+            "equivalent_eccentricity_um": "等效偏心距",
+            "total_mass_g": "总质量",
+            "angular_velocity_rad_s": "角速度",
+        }
+        for key, label in labels.items():
+            _assert_finite(float(metrics[key]), f"{label}({key})")
+        for key in ("u1_angle_deg", "u1_x_g_mm", "u1_y_g_mm",
+                    "u2_angle_deg", "u2_x_g_mm", "u2_y_g_mm", "rpm"):
+            _assert_finite(float(metrics[key]), f"指标 {key}")
 
     @staticmethod
     def _grade(ecc_mm: float) -> str:
@@ -1337,9 +1454,39 @@ def _parse_mutex_pairs(raw: Any) -> list[tuple[int, int]]:
     return pairs
 
 
+def _as_float(raw: Any, name: str, default: float) -> float:
+    """把请求参数转换为 float; 类型不可转换时抛 ValueError(而非 TypeError)。"""
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} 必须是数值。")
+
+
+def _as_int(raw: Any, name: str, default: int) -> int:
+    """把请求参数转换为 int; NaN/Inf、非整数或不可转换值统一抛 ValueError。"""
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        raise ValueError(f"{name} 必须是整数。")
+    if isinstance(raw, int):
+        return raw
+    try:
+        f = float(raw)
+    except (TypeError, ValueError):
+        raise ValueError(f"{name} 必须是整数。")
+    if not math.isfinite(f) or not f.is_integer():
+        raise ValueError(f"{name} 必须是整数。")
+    return int(f)
+
+
 def run_plan(payload: dict[str, Any]) -> dict[str, Any]:
     """API 层入口: 解析 JSON 风格的请求并求解。"""
-    slot_count = int(payload.get("slot_count", len(payload.get("slots") or [])))
+    slot_count = _as_int(
+        payload.get("slot_count", len(payload.get("slots") or [])),
+        "槽位数量", 0,
+    )
     # 按槽号规范化(乱序合法输入按编号求解; 重复/缺失/非有限角度抛 ValueError)。
     # 同时回写 payload, 使落库请求与实际求解几何一致。
     norm_slots = canonicalize_slots(payload.get("slots"), slot_count)
@@ -1353,26 +1500,33 @@ def run_plan(payload: dict[str, Any]) -> dict[str, Any]:
         )
         for s in norm_slots
     ]
-    tubes = [
-        Tube(
-            id=int(t["id"]),
-            mass=float(t["mass"]),
-            locked=bool(t.get("locked", False)),
-            slot=(int(t["slot"]) if t.get("slot") is not None else None),
-        )
-        for t in payload["tubes"]
-    ]
+    tubes = []
+    for t in payload["tubes"]:
+        try:
+            tid = int(t["id"])
+            mass = float(t["mass"])
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("每支试管必须给出整数编号 id 与数值质量 mass。")
+        locked = bool(t.get("locked", False))
+        slot_raw = t.get("slot")
+        tubes.append(Tube(
+            id=tid,
+            mass=mass,
+            locked=locked,
+            slot=(_as_int(slot_raw, f"试管 {tid} 的锁定槽位", 0)
+                  if slot_raw is not None else None),
+        ))
     solver = Solver(
         slots=slots,
         tubes=tubes,
-        radius_mm=float(payload.get("radius_mm", 100.0)),
-        rpm=float(payload.get("rpm", 4000.0)),
-        w1=float(payload.get("w1", 1.0)),
-        w2=float(payload.get("w2", 0.000001)),
-        move_weight=float(payload.get("move_weight", 0.0)),
-        restarts=int(payload.get("restarts", 10)),
-        chain_steps=int(payload.get("chain_steps", 2500)),
-        seed=int(payload.get("seed", 20260923)),
+        radius_mm=_as_float(payload.get("radius_mm"), "转子半径", 100.0),
+        rpm=_as_float(payload.get("rpm"), "转速", 4000.0),
+        w1=_as_float(payload.get("w1"), "一阶权重 w1", 1.0),
+        w2=_as_float(payload.get("w2"), "二阶权重 w2", 0.000001),
+        move_weight=_as_float(payload.get("move_weight"), "移动罚权 move_weight", 0.0),
+        restarts=_as_int(payload.get("restarts"), "随机起点数", 10),
+        chain_steps=_as_int(payload.get("chain_steps"), "退火链长度", 2500),
+        seed=_as_int(payload.get("seed"), "随机种子", 20260923),
         mutex_pairs=_parse_mutex_pairs(payload.get("mutex_pairs")),
     )
     previous = payload.get("previous")

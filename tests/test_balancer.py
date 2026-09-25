@@ -280,5 +280,133 @@ class TestBalancer(unittest.TestCase):
             self.assertIn("reason", sg)
 
 
+class TestNumericBoundaries(unittest.TestCase):
+    """非有限输入与计算溢出: 一律 ValueError, 不产生非有限指标/异常。"""
+
+    def _payload(self, **over):
+        p = base_payload()
+        p["tubes"] = [{"id": 1, "mass": 50}, {"id": 2, "mass": 50},
+                      {"id": 3, "mass": 51}, {"id": 4, "mass": 49}]
+        p.update(over)
+        return p
+
+    # ---- 非有限输入直接拒绝 ----
+    def test_nonfinite_tube_mass_rejected(self):
+        for bad in (float("nan"), float("inf"), float("-inf")):
+            p = self._payload()
+            p["tubes"][0]["mass"] = bad
+            with self.assertRaises(ValueError):
+                run_plan(p)
+
+    def test_nonfinite_weights_rejected(self):
+        for field in ("w1", "w2", "move_weight"):
+            for bad in (float("nan"), float("inf"), float("-inf")):
+                p = self._payload()
+                p[field] = bad
+                with self.assertRaises(ValueError):
+                    run_plan(p)
+
+    def test_negative_weights_rejected(self):
+        for field in ("w1", "w2", "move_weight"):
+            p = self._payload()
+            p[field] = -0.5
+            with self.assertRaises(ValueError):
+                run_plan(p)
+
+    def test_nonfinite_radius_and_rpm_rejected(self):
+        for field in ("radius_mm", "rpm"):
+            for bad in (float("nan"), float("inf"), float("-inf")):
+                p = self._payload()
+                p[field] = bad
+                with self.assertRaises(ValueError):
+                    run_plan(p)
+
+    def test_non_integer_numeric_params_rejected(self):
+        for field in ("restarts", "chain_steps", "seed"):
+            p = self._payload()
+            p[field] = float("nan")
+            with self.assertRaises(ValueError):
+                run_plan(p)
+            p = self._payload()
+            p[field] = 2.5
+            with self.assertRaises(ValueError):
+                run_plan(p)
+
+    def test_non_numeric_mass_rejected(self):
+        p = self._payload()
+        p["tubes"][0]["mass"] = "not-a-number"
+        with self.assertRaises(ValueError):
+            run_plan(p)
+
+    # ---- 有限但极大的输入: 溢出时拒绝, 不抛未处理异常 ----
+    def test_overflowing_mass_radius_product_rejected(self):
+        p = self._payload(radius_mm=1e200)
+        p["tubes"] = [{"id": i, "mass": 1e200} for i in range(1, 4)]
+        with self.assertRaises(ValueError):
+            run_plan(p)
+
+    def test_overflowing_rpm_force_rejected(self):
+        p = self._payload(rpm=1e200)
+        with self.assertRaises(ValueError):
+            run_plan(p)
+
+    def test_mutex_overflow_rejected_not_infeasible(self):
+        # 6 环上 2 支极大管: 对径摆放合法, 但评分/指标溢出 -> 数值错误而非"不可行"
+        p = {
+            "slot_count": 6,
+            "slots": [{"index": i, "angle": 60.0 * i, "enabled": True}
+                      for i in range(6)],
+            "tubes": [{"id": 1, "mass": 1e300}, {"id": 2, "mass": 1e300}],
+            "radius_mm": 1e100, "restarts": 2, "chain_steps": 100,
+            "mutex_pairs": [{"tube_a": 1, "tube_b": 2}],
+        }
+        with self.assertRaises(ValueError):
+            run_plan(p)
+
+    # ---- 有限极大但可表示时: 溢出布局被规避, 选出有限的平衡布局 ----
+    def test_huge_but_representable_still_balances(self):
+        # mR=1e200: 非平衡布局评分溢出为 inf, 对径/十字平衡布局仍有限且被选中
+        m_scale, R = 1e100, 1e100
+        p = {
+            "slot_count": 12,
+            "slots": [{"index": i, "angle": 30.0 * i, "enabled": True}
+                      for i in range(12)],
+            "tubes": [{"id": i, "mass": m_scale} for i in range(1, 5)],
+            "radius_mm": R, "restarts": 4, "chain_steps": 300,
+        }
+        r = run_plan(p)
+        for key, val in r["metrics"].items():
+            if isinstance(val, float):
+                self.assertTrue(math.isfinite(val), f"{key} 非有限")
+        # 四支等质量落在两对径槽; 残差只来自 mR≈1e200 的浮点对消噪声(相对 ~1e-15)
+        self.assertLess(r["metrics"]["u1_mag_g_mm"], m_scale * R * 1e-12)
+
+    # ---- 正常输入: 指标全有限, 语义不变 ----
+    def test_normal_result_fully_finite_and_serializable(self):
+        r = run_plan(self._payload())
+        def walk(node):
+            if isinstance(node, bool):
+                return
+            if isinstance(node, float):
+                self.assertTrue(math.isfinite(node))
+            elif isinstance(node, dict):
+                for v in node.values():
+                    walk(v)
+            elif isinstance(node, (list, tuple)):
+                for v in node:
+                    walk(v)
+        walk(r)
+        # 结果必须可用标准 JSON(allow_nan=False)序列化, 否则响应/落库会失败
+        json.dumps(r, allow_nan=False)
+
+    def test_zero_rpm_zero_force_preserved(self):
+        # 边界合法值: rpm=0 -> 离心合力/角速度为 0, 指标有限
+        p = self._payload(rpm=0.0)
+        m = run_plan(p)["metrics"]
+        self.assertEqual(m["centrifugal_force_n"], 0.0)
+        self.assertEqual(m["angular_velocity_rad_s"], 0.0)
+        self.assertTrue(math.isfinite(m["resultant_moment_n_m"]))
+
+
 if __name__ == "__main__":
     unittest.main()

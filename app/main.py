@@ -327,9 +327,11 @@ def _save_plan(name: str, payload: dict[str, Any], result: dict[str, Any],
             (
                 name,
                 datetime.now(timezone.utc).isoformat(),
-                json.dumps(payload, ensure_ascii=False),
-                json.dumps(result, ensure_ascii=False),
-                json.dumps(result["metrics"], ensure_ascii=False),
+                # allow_nan=False: 非有限值无法被标准 JSON 消费端解析,
+                # 结果有限性闸门已在上游拒绝此类方案; 这里再兜底防落库。
+                json.dumps(payload, ensure_ascii=False, allow_nan=False),
+                json.dumps(result, ensure_ascii=False, allow_nan=False),
+                json.dumps(result["metrics"], ensure_ascii=False, allow_nan=False),
                 parent_id,
             ),
         )
